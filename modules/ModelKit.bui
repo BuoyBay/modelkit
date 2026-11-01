@@ -1,0 +1,760 @@
+' Synchronous model clients. Keep network work off the UI thread.
+Public Enum ModelProvider As Integer
+    Grok = 1
+    MetaMuse = 2
+End Enum
+
+Private Function ModelHexValue(octet As Integer) As Integer
+    If octet >= 48 And octet <= 57 Then Return octet - 48
+    If octet >= 65 And octet <= 70 Then Return octet - 55
+    If octet >= 97 And octet <= 102 Then Return octet - 87
+    Return -1
+End Function
+
+Private Sub ValidateJSONNumber(token As String)
+    Dim data As Bytes = Bytes.FromString(token, Text.Encodings.UTF8)
+    Dim i As Integer = 0
+    Dim count As Integer = data.Count
+    If count > 0 Then
+        If data.Item(0) = 45 Then i = 1
+    End If
+    If i >= count Then Throw New InvalidArgumentException("Invalid model JSON number")
+    Dim first As Integer = data.Item(i)
+    If first = 48 Then
+        i += 1
+    Else
+        If first < 49 Or first > 57 Then Throw New InvalidArgumentException("Invalid model JSON number")
+        i += 1
+        While i < count
+            Dim scalar As Integer = data.Item(i)
+            If scalar < 48 Or scalar > 57 Then Exit While
+            i += 1
+        End While
+    End If
+    If i < count Then
+        If data.Item(i) = 46 Then
+            i += 1
+            Dim digits As Integer = 0
+            While i < count
+                Dim scalar As Integer = data.Item(i)
+                If scalar < 48 Or scalar > 57 Then Exit While
+                i += 1
+                digits += 1
+            End While
+            If digits = 0 Then Throw New InvalidArgumentException("Invalid model JSON number")
+        End If
+    End If
+    If i < count Then
+        Dim exponentMarker As Integer = data.Item(i)
+        If exponentMarker = 101 Or exponentMarker = 69 Then
+            i += 1
+            If i < count Then
+                Dim sign As Integer = data.Item(i)
+                If sign = 43 Or sign = 45 Then i += 1
+            End If
+            Dim digits As Integer = 0
+            While i < count
+                Dim scalar As Integer = data.Item(i)
+                If scalar < 48 Or scalar > 57 Then Exit While
+                i += 1
+                digits += 1
+            End While
+            If digits = 0 Then Throw New InvalidArgumentException("Invalid model JSON number")
+        End If
+    End If
+    If i <> count Then Throw New InvalidArgumentException("Invalid model JSON number")
+    Dim parsedNumber As Result Of Double, String = Double.Parse(token)
+    If parsedNumber.IsErr Then Throw New InvalidArgumentException("Invalid model JSON number")
+    Dim scalar As Double = parsedNumber.Value
+    If scalar <> scalar Or scalar = Double.Infinity Or scalar = -Double.Infinity Then Throw New InvalidArgumentException("Nonfinite model JSON number")
+End Sub
+
+' Bound nesting and validate lexical forms before the runtime JSON parser sees untrusted text.
+Private Function ParseModelJSON(source As String) As JSONItem
+    Dim data As Bytes = Bytes.FromString(source, Text.Encodings.UTF8)
+    If data.Count > 268435456 Then Throw New InvalidArgumentException("Model JSON is too large")
+    data.ToString(Text.Encodings.UTF8)
+    Dim depth As Integer = 0
+    Dim quoted As Boolean = False
+    Dim i As Integer = 0
+    While i < data.Count
+        Dim octet As Integer = data.Item(i)
+        If octet = 0 Then Throw New InvalidArgumentException("NUL is not permitted in model JSON")
+        If quoted Then
+            If octet < 32 Then Throw New InvalidArgumentException("Control character in model JSON string")
+            If octet = 34 Then
+                quoted = False
+            ElseIf octet = 92 Then
+                i += 1
+                If i >= data.Count Then Throw New InvalidArgumentException("Truncated model JSON escape")
+                Dim escape As Integer = data.Item(i)
+                If escape = 117 Then
+                    If i + 4 >= data.Count Then Throw New InvalidArgumentException("Truncated model JSON Unicode escape")
+                    Dim codepoint As Integer = 0
+                    For j As Integer = 1 To 4
+                        Dim value As Integer = ModelHexValue(data.Item(i + j))
+                        If value < 0 Then Throw New InvalidArgumentException("Invalid model JSON Unicode escape")
+                        codepoint = codepoint * 16 + value
+                    Next
+                    If codepoint = 0 Then Throw New InvalidArgumentException("Escaped NUL is not permitted in model JSON")
+                    i += 4
+                    If codepoint >= 55296 And codepoint <= 56319 Then
+                        If i + 6 >= data.Count Then Throw New InvalidArgumentException("Unpaired model JSON surrogate")
+                        If data.Item(i + 1) <> 92 Or data.Item(i + 2) <> 117 Then Throw New InvalidArgumentException("Unpaired model JSON surrogate")
+                        Dim low As Integer = 0
+                        For j As Integer = 3 To 6
+                            Dim value As Integer = ModelHexValue(data.Item(i + j))
+                            If value < 0 Then Throw New InvalidArgumentException("Invalid model JSON Unicode escape")
+                            low = low * 16 + value
+                        Next
+                        If low < 56320 Or low > 57343 Then Throw New InvalidArgumentException("Unpaired model JSON surrogate")
+                        i += 6
+                    ElseIf codepoint >= 56320 And codepoint <= 57343 Then
+                        Throw New InvalidArgumentException("Unpaired model JSON surrogate")
+                    End If
+                ElseIf escape <> 34 And escape <> 92 And escape <> 47 And escape <> 98 And escape <> 102 And escape <> 110 And escape <> 114 And escape <> 116 Then
+                    Throw New InvalidArgumentException("Invalid model JSON escape")
+                End If
+            End If
+        ElseIf octet = 34 Then
+            quoted = True
+        ElseIf octet = 91 Or octet = 123 Then
+            depth += 1
+            If depth > 128 Then Throw New InvalidArgumentException("Model JSON exceeds nesting limit")
+        ElseIf octet = 93 Or octet = 125 Then
+            depth -= 1
+            If depth < 0 Then Throw New InvalidArgumentException("Unbalanced model JSON")
+        ElseIf octet <> 32 And octet <> 9 And octet <> 10 And octet <> 13 And octet <> 44 And octet <> 58 Then
+            Dim token As New Bytes()
+            While i < data.Count
+                Dim current As Integer = data.Item(i)
+                If current = 32 Or current = 9 Or current = 10 Or current = 13 Or current = 44 Or current = 58 Or current = 91 Or current = 93 Or current = 123 Or current = 125 Or current = 34 Then Exit While
+                token.Append(current)
+                i += 1
+            End While
+            Dim text As String = token.ToString(Text.Encodings.UTF8)
+            If String.Compare(text, "true", True) <> 0 And String.Compare(text, "false", True) <> 0 And String.Compare(text, "null", True) <> 0 Then ValidateJSONNumber(text)
+            i -= 1
+        End If
+        i += 1
+    End While
+    If quoted Or depth <> 0 Then Throw New InvalidArgumentException("Incomplete model JSON")
+    Dim parsed As Optional Of JSONItem = Json.TryParse(source)
+    If Not parsed.HasValue Then Throw New InvalidArgumentException("Malformed model JSON")
+    Return parsed.Value
+End Function
+
+
+Private Function CopyJSON(item As JSONItem) As JSONItem
+    If item = Nil Then Throw New InvalidArgumentException("JSON value is required")
+    Return ParseModelJSON(Json.Stringify(item))
+End Function
+
+Private Sub CheckHeaderText(value As String)
+    Dim data As Bytes = Bytes.FromString(value, Text.Encodings.UTF8)
+    For i As Integer = 0 To data.Count - 1
+        If data.Item(i) < 32 Or data.Item(i) = 127 Then Throw New InvalidArgumentException("Control character in model configuration")
+    Next
+End Sub
+
+Private Function ValidateBase(value As String, allowLoopbackHTTP As Boolean) As String
+    CheckHeaderText(value)
+    If String.Contains(value, "?") Or String.Contains(value, "#") Or String.Contains(value, "\\") Or String.Contains(value, "%") Then Throw New InvalidArgumentException("Invalid API base URL")
+    Dim prefix As String = "https://"
+    If String.StartsWith(value, "http://") Then prefix = "http://"
+    If Not String.StartsWith(value, prefix) Then Throw New InvalidArgumentException("API base URL requires HTTPS")
+    Dim remainder As String = String.Substring(value, String.Len(prefix))
+    Dim slash As Integer = String.IndexOf(remainder, "/")
+    Dim authority As String = remainder
+    If slash >= 0 Then authority = String.Left(remainder, slash)
+    If authority = "" Or String.Contains(authority, "@") Or String.Contains(authority, " ") Then Throw New InvalidArgumentException("Invalid API authority")
+    If prefix = "http://" Then
+        If Not allowLoopbackHTTP Then Throw New InvalidArgumentException("HTTP is allowed only for explicit loopback fixtures")
+        Dim hostname As String = authority
+        Dim colon As Integer = String.IndexOf(authority, ":")
+        If colon >= 0 Then hostname = String.Left(authority, colon)
+        If hostname <> "127.0.0.1" And hostname <> "localhost" Then Throw New InvalidArgumentException("HTTP requires loopback host")
+    End If
+    Dim clean As String = value
+    While String.EndsWith(clean, "/")
+        clean = String.Left(clean, String.Len(clean) - 1)
+    End While
+    Dim pieces As Array Of String = String.Split(clean, "/")
+    For i As Integer = 3 To Array.Count(pieces) - 1
+        If pieces(i) = "." Or pieces(i) = ".." Then Throw New InvalidArgumentException("API base path traversal is forbidden")
+    Next
+    Return clean
+End Function
+
+Private Function Header(connection As URLConnection, name As String) As String
+    For Each entry In connection.ResponseHeaders.Entries()
+        If String.LCase(entry.Key) = String.LCase(name) Then Return entry.Value
+    Next
+    Return ""
+End Function
+
+Private Sub RequireArray(item As JSONItem, label As String)
+    If item = Nil Then Throw New InvalidArgumentException(label + " is required")
+    If Not item.IsArray() Then Throw New InvalidArgumentException(label + " must be an array")
+End Sub
+
+Private Sub RequireModel(model As String)
+    CheckHeaderText(model)
+    If String.Trim(model) = "" Then Throw New InvalidArgumentException("An explicit model ID is required")
+End Sub
+
+Private Sub RequireToolName(name As String)
+    If String.Len(name) < 1 Or String.Len(name) > 64 Then Throw New InvalidArgumentException("Tool name length must be 1..64")
+    For Each character As String In String.Chars(name)
+        If Not String.Contains("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-", character, True) Then Throw New InvalidArgumentException("Invalid tool name")
+    Next
+End Sub
+
+''' The error message excludes raw response bodies; metadata is sanitized before exposure.
+Public Class ModelAPIException Inherits Exception
+    Public Property Status As Integer
+    Public Property RequestID As String
+    Public Property RetryAfter As String
+    Public Property RateLimitRemaining As String
+    Public Property APIMessage As String
+
+    Internal Sub Constructor(status As Integer, requestID As String, retryAfter As String, remaining As String, apiMessage As String)
+        Super.Constructor("Model API returned HTTP " + String.From(status) + ": " + apiMessage, status)
+        Me.APIMessage = apiMessage
+        Me.Status = status
+        Me.RequestID = requestID
+        Me.RetryAfter = retryAfter
+        Me.RateLimitRemaining = remaining
+    End Sub
+End Class
+
+Public Class ModelToolCall
+    Private Property mCallID As String
+    Private Property mItemID As String
+    Private Property mName As String
+    Private Property mArguments As String
+    Private Property mRaw As JSONItem
+
+    Internal Sub Constructor(callID As String, itemID As String, name As String, arguments As String, raw As JSONItem)
+        If callID = "" Or name = "" Then Throw New InvalidArgumentException("Malformed model function call")
+        Me.mCallID = callID
+        Me.mItemID = itemID
+        Me.mName = name
+        Me.mArguments = arguments
+        Me.mRaw = CopyJSON(raw)
+    End Sub
+
+    Public Property CallID As String
+        Get
+            Return Me.mCallID
+        End Get
+    End Property
+    Public Property ItemID As String
+        Get
+            Return Me.mItemID
+        End Get
+    End Property
+    Public Property Name As String
+        Get
+            Return Me.mName
+        End Get
+    End Property
+    Public Property ArgumentsText As String
+        Get
+            Return Me.mArguments
+        End Get
+    End Property
+    Public Property RawJSON As JSONItem
+        Get
+            Return CopyJSON(Me.mRaw)
+        End Get
+    End Property
+
+    ''' Arguments are untrusted: parse and validate against the host's own schema before execution.
+    Public Function ParseArguments() As JSONItem
+        Dim parsed As JSONItem = ParseModelJSON(Me.mArguments)
+        If Not parsed.IsObject() Then Throw New InvalidArgumentException("Function arguments must be a JSON object")
+        Return parsed
+    End Function
+
+    Public Function ResultItem(content As String, responsesAPI As Boolean = True) As JSONItem
+        Dim item As JSONItem = JSONItem.NewObject()
+        If responsesAPI Then
+            item.Value("type") = "function_call_output"
+            item.Value("call_id") = Me.mCallID
+            item.Value("output") = content
+        Else
+            item.Value("role") = "tool"
+            item.Value("tool_call_id") = Me.mCallID
+            item.Value("content") = content
+        End If
+        Return item
+    End Function
+End Class
+
+Public Class ModelReply
+    Private Property mRaw As JSONItem
+    Private Property mText As String = ""
+    Private Property mCalls As Array Of ModelToolCall = []
+    Private Property mFinish As String
+    Private Property mID As String
+    Private Property mResponses As Boolean
+    Private Property mAssistant As JSONItem
+
+    Internal Sub Constructor(raw As JSONItem, responsesAPI As Boolean)
+        If Not raw.IsObject() Then Throw New InvalidArgumentException("Malformed model response")
+        Me.mRaw = CopyJSON(raw)
+        Me.mResponses = responsesAPI
+        Me.mID = raw.Value("id").AsString().Or("")
+        If responsesAPI Then
+            Me.mFinish = raw.Value("status").AsString().Or("")
+            Dim output As JSONItem = raw.Value("output")
+            RequireArray(output, "Response output")
+            For i As Integer = 0 To output.Count() - 1
+                Dim item As JSONItem = output.ValueAt(i)
+                Dim kind As String = item.Value("type").AsString().Or("")
+                If kind = "message" Then
+                    Dim blocks As JSONItem = item.Value("content")
+                    RequireArray(blocks, "Message content")
+                    For j As Integer = 0 To blocks.Count() - 1
+                        Dim contentBlock As JSONItem = blocks.ValueAt(j)
+                        If contentBlock.Value("type").AsString().Or("") = "output_text" Then Me.mText += contentBlock.Value("text").AsString().Or("")
+                    Next
+                ElseIf kind = "function_call" Then
+                    If Not item.Value("arguments").IsString() Then Throw New InvalidArgumentException("Function arguments must be a JSON string")
+                    Array.Append(Me.mCalls, New ModelToolCall(item.Value("call_id").AsString().Or(""), item.Value("id").AsString().Or(""), item.Value("name").AsString().Or(""), item.Value("arguments").AsString().Or(""), item))
+                End If
+            Next
+        Else
+            Dim choices As JSONItem = raw.Value("choices")
+            RequireArray(choices, "Chat choices")
+            If choices.Count() <> 1 Then Throw New InvalidArgumentException("Exactly one chat choice is supported")
+            Dim choice As JSONItem = choices.ValueAt(0)
+            Me.mFinish = choice.Value("finish_reason").AsString().Or("")
+            Me.mAssistant = CopyJSON(choice.Value("message"))
+            If Me.mAssistant.Value("role").AsString().Or("") <> "assistant" Then Throw New InvalidArgumentException("Expected assistant chat message")
+            Me.mText = Me.mAssistant.Value("content").AsString().Or("")
+            Dim calls As JSONItem = Me.mAssistant.Value("tool_calls")
+            If Not calls.IsNull() Then
+                RequireArray(calls, "Chat tool calls")
+                For i As Integer = 0 To calls.Count() - 1
+                    Dim item As JSONItem = calls.ValueAt(i)
+                    If item.Value("type").AsString().Or("") <> "function" Then Throw New InvalidArgumentException("Unsupported chat tool call type")
+                    Dim fn As JSONItem = item.Value("function")
+                    If Not fn.Value("arguments").IsString() Then Throw New InvalidArgumentException("Function arguments must be a JSON string")
+                    Array.Append(Me.mCalls, New ModelToolCall(item.Value("id").AsString().Or(""), item.Value("id").AsString().Or(""), fn.Value("name").AsString().Or(""), fn.Value("arguments").AsString().Or(""), item))
+                Next
+            End If
+        End If
+    End Sub
+
+    Public Property Text As String
+        Get
+            Return Me.mText
+        End Get
+    End Property
+    Public Property ToolCalls As Array Of ModelToolCall
+        Get
+            Return Array.Clone(Me.mCalls)
+        End Get
+    End Property
+    Public Property FinishReason As String
+        Get
+            Return Me.mFinish
+        End Get
+    End Property
+    Public Property ResponseID As String
+        Get
+            Return Me.mID
+        End Get
+    End Property
+    Public Property RawJSON As JSONItem
+        Get
+            Return CopyJSON(Me.mRaw)
+        End Get
+    End Property
+
+    ''' Appends every raw output item, including reasoning replay, or the whole assistant chat message.
+    Public Sub AppendOutputTo(history As JSONItem)
+        RequireArray(history, "History")
+        If Me.mResponses Then
+            Dim output As JSONItem = Me.mRaw.Value("output")
+            For i As Integer = 0 To output.Count() - 1
+                history.Add(CopyJSON(output.ValueAt(i)))
+            Next
+        Else
+            history.Add(CopyJSON(Me.mAssistant))
+        End If
+    End Sub
+End Class
+
+Public Function FunctionTool(name As String, description As String, parameters As JSONItem, responsesAPI As Boolean = True) As JSONItem
+    RequireToolName(name)
+    If parameters = Nil Then Throw New InvalidArgumentException("Tool schema required")
+    If Not parameters.IsObject() Or parameters.Value("type").AsString().Or("") <> "object" Then Throw New InvalidArgumentException("Tool parameters must be an object schema")
+    Dim fn As JSONItem = JSONItem.NewObject()
+    fn.Value("name") = name
+    fn.Value("description") = description
+    fn.Value("parameters") = CopyJSON(parameters)
+    Dim tool As JSONItem = JSONItem.NewObject()
+    tool.Value("type") = "function"
+    If responsesAPI Then
+        For Each key As String In fn.Keys()
+            tool.Value(key) = CopyJSON(fn.Value(key))
+        Next
+    Else
+        tool.Value("function") = fn
+    End If
+    Return tool
+End Function
+
+Public Function TextMessage(role As String, content As String, responsesAPI As Boolean = True) As JSONItem
+    If role <> "system" And role <> "developer" And role <> "user" And role <> "assistant" Then Throw New InvalidArgumentException("Unsupported message role")
+    Dim item As JSONItem = JSONItem.NewObject()
+    item.Value("role") = role
+    If responsesAPI Then
+        Dim contentBlock As JSONItem = JSONItem.NewObject()
+        If role = "assistant" Then
+            contentBlock.Value("type") = "output_text"
+        Else
+            contentBlock.Value("type") = "input_text"
+        End If
+        contentBlock.Value("text") = content
+        Dim blocks As JSONItem = JSONItem.NewArray()
+        blocks.Add(contentBlock)
+        item.Value("content") = blocks
+    Else
+        item.Value("content") = content
+    End If
+    Return item
+End Function
+
+Public Function ParseModelReply(raw As JSONItem, responsesAPI As Boolean = True) As ModelReply
+    Return New ModelReply(raw, responsesAPI)
+End Function
+
+Public Class ModelClient
+    Private Property mProvider As ModelProvider
+    Private Property mToken As String
+    Private Property mBase As String
+    Public Property TimeoutSeconds As Integer = 60
+    Public Property MaxResponseBytes As Integer = 16777216
+
+    Public Sub Constructor(provider As ModelProvider, token As String, apiBase As String, allowLoopbackHTTP As Boolean = False)
+        If provider <> ModelProvider.Grok And provider <> ModelProvider.MetaMuse Then Throw New InvalidArgumentException("Unknown model provider")
+        CheckHeaderText(token)
+        If token = "" Then Throw New InvalidArgumentException("API token required")
+        Me.mProvider = provider
+        Me.mToken = token
+        Me.mBase = ValidateBase(apiBase, allowLoopbackHTTP)
+    End Sub
+
+    Public Shared Function ForGrok(token As String) As ModelClient
+        Return New ModelClient(ModelProvider.Grok, token, "https://api.x.ai/v1")
+    End Function
+    Public Shared Function ForMetaMuse(token As String) As ModelClient
+        Return New ModelClient(ModelProvider.MetaMuse, token, "https://api.meta.ai/v1")
+    End Function
+    Public Property Provider As ModelProvider
+        Get
+            Return Me.mProvider
+        End Get
+    End Property
+    Public Property BaseURL As String
+        Get
+            Return Me.mBase
+        End Get
+    End Property
+
+    Private Function SafeMetadata(value As String) As String
+        Return String.Replace(value, Me.mToken, "[redacted]")
+    End Function
+
+    Private Function SendRequest(route As String, body As JSONItem) As JSONItem
+        If Me.TimeoutSeconds < 1 Or Me.TimeoutSeconds > 3600 Then Throw New InvalidArgumentException("Timeout must be 1..3600 seconds")
+        If Me.MaxResponseBytes < 1 Or Me.MaxResponseBytes > 268435456 Then Throw New InvalidArgumentException("Invalid response size limit")
+        Dim connection As New URLConnection()
+        connection.Timeout = Me.TimeoutSeconds
+        connection.ConnectionTimeout = Me.TimeoutSeconds
+        connection.FollowRedirects = False
+        connection.VerifySSL = True
+        connection.RequestHeaders.Set("Authorization", "Bearer " + Me.mToken)
+        connection.RequestHeaders.Set("Content-Type", "application/json")
+        connection.RequestHeaders.Set("Accept", "application/json")
+        Dim responseText As String
+        Try
+            responseText = connection.Post(Me.mBase + route, Json.Stringify(body))
+        Catch e As NetworkingException
+            Throw New NetworkingException("Model API transport failed")
+        End Try
+        If Bytes.FromString(responseText, Text.Encodings.UTF8).Count > Me.MaxResponseBytes Then Throw New InvalidArgumentException("Model response exceeds configured size limit")
+        If connection.HTTPStatus < 200 Or connection.HTTPStatus > 299 Then
+            Dim apiMessage As String = "Request was not accepted"
+            Try
+                Dim parsed As JSONItem = ParseModelJSON(responseText)
+                apiMessage = parsed.Value("error").Value("message").AsString().Or(apiMessage)
+            Catch malformed As Exception
+                ' Preserve HTTP status while never passing malformed error JSON to the runtime parser.
+            End Try
+            apiMessage = String.Left(Me.SafeMetadata(apiMessage), 2048)
+            Throw New ModelAPIException(connection.HTTPStatus, Me.SafeMetadata(Header(connection, "X-Request-ID")), Me.SafeMetadata(Header(connection, "Retry-After")), Me.SafeMetadata(Header(connection, "X-RateLimit-Remaining")), apiMessage)
+        End If
+        Return ParseModelJSON(responseText)
+    End Function
+
+    Private Sub CheckTools(tools As JSONItem, responsesAPI As Boolean)
+        RequireArray(tools, "Tools")
+        If tools.Count() > 128 Then Throw New InvalidArgumentException("Too many function tools")
+        Dim seen As New Set Of String()
+        For i As Integer = 0 To tools.Count() - 1
+            Dim item As JSONItem = tools.ValueAt(i)
+            If item.Value("type").AsString().Or("") <> "function" Then Throw New InvalidArgumentException("Only local function tools are supported")
+            Dim fn As JSONItem = item
+            If Not responsesAPI Then fn = item.Value("function")
+            Dim name As String = fn.Value("name").AsString().Or("")
+            RequireToolName(name)
+            If seen.Contains(name) Then Throw New InvalidArgumentException("Duplicate function tool name")
+            seen.Add(name)
+            Dim parameters As JSONItem = fn.Value("parameters")
+            If Not parameters.IsObject() Or parameters.Value("type").AsString().Or("") <> "object" Then Throw New InvalidArgumentException("Expected object tool schema")
+        Next
+    End Sub
+
+    Public Function CreateResponse(model As String, input As JSONItem, tools As JSONItem) As ModelReply
+        Return Me.ContinueResponse(model, input, tools, "", False)
+    End Function
+
+    Public Function ContinueResponse(model As String, input As JSONItem, tools As JSONItem, previousResponseID As String, store As Boolean = False) As ModelReply
+        RequireModel(model)
+        If input = Nil Then Throw New InvalidArgumentException("Response input required")
+        If Not input.IsString() And Not input.IsArray() Then Throw New InvalidArgumentException("Response input must be text or an array")
+        Me.CheckTools(tools, True)
+        CheckHeaderText(previousResponseID)
+        If previousResponseID <> "" And Not store Then Throw New InvalidArgumentException("Server-managed continuation requires store=True")
+        Dim body As JSONItem = JSONItem.NewObject()
+        body.Value("model") = model
+        body.Value("input") = CopyJSON(input)
+        body.Value("tools") = CopyJSON(tools)
+        body.Value("stream") = False
+        body.Value("store") = store
+        If previousResponseID <> "" Then body.Value("previous_response_id") = previousResponseID
+        ' Keep encrypted reasoning items available for explicit stateless replay.
+        Dim include As JSONItem = JSONItem.NewArray()
+        include.Add("reasoning.encrypted_content")
+        body.Value("include") = include
+        Return New ModelReply(Me.SendRequest("/responses", body), True)
+    End Function
+
+    Private Sub CheckChatMessages(messages As JSONItem)
+        RequireArray(messages, "Messages")
+        If messages.Count() < 1 Or messages.Count() > 10000 Then Throw New InvalidArgumentException("Chat message count must be 1..10000")
+        Dim pending As New Set Of String()
+        For i As Integer = 0 To messages.Count() - 1
+            Dim item As JSONItem = messages.ValueAt(i)
+            Dim role As String = item.Value("role").AsString().Or("")
+            If role = "tool" Then
+                Dim callID As String = item.Value("tool_call_id").AsString().Or("")
+                If Not pending.Contains(callID) Then Throw New InvalidArgumentException("Tool result has no matching pending call")
+                If Not item.Value("content").IsString() Then Throw New InvalidArgumentException("Tool result content must be text")
+                pending.Remove(callID)
+                Continue For
+            End If
+            If Not pending.IsEmpty() Then Throw New InvalidArgumentException("All tool calls require results before the next message")
+            If role <> "system" And role <> "developer" And role <> "user" And role <> "assistant" Then Throw New InvalidArgumentException("Unsupported chat role")
+            Dim calls As JSONItem = item.Value("tool_calls")
+            If Not calls.IsNull() Then
+                If role <> "assistant" Then Throw New InvalidArgumentException("Only assistant messages contain tool calls")
+                RequireArray(calls, "Tool calls")
+                For j As Integer = 0 To calls.Count() - 1
+                    Dim callItem As JSONItem = calls.ValueAt(j)
+                    Dim callID As String = callItem.Value("id").AsString().Or("")
+                    If callID = "" Or pending.Contains(callID) Then Throw New InvalidArgumentException("Missing or duplicate tool call ID")
+                    If callItem.Value("type").AsString().Or("") <> "function" Then Throw New InvalidArgumentException("Unsupported tool call type")
+                    RequireToolName(callItem.Value("function").Value("name").AsString().Or(""))
+                    If Not callItem.Value("function").Value("arguments").IsString() Then Throw New InvalidArgumentException("Tool arguments must be encoded as a JSON string")
+                    pending.Add(callID)
+                Next
+            End If
+            If Not item.Value("content").IsString() And Not (role = "assistant" And pending.Count() > 0 And item.Value("content").IsNull()) Then Throw New InvalidArgumentException("This chat client accepts text content only")
+        Next
+        If Not pending.IsEmpty() Then Throw New InvalidArgumentException("Unanswered tool calls in outgoing chat history")
+    End Sub
+
+    Public Function Chat(model As String, messages As JSONItem, tools As JSONItem) As ModelReply
+        RequireModel(model)
+        Me.CheckChatMessages(messages)
+        Me.CheckTools(tools, False)
+        Dim body As JSONItem = JSONItem.NewObject()
+        body.Value("model") = model
+        body.Value("messages") = CopyJSON(messages)
+        body.Value("tools") = CopyJSON(tools)
+        body.Value("stream") = False
+        Return New ModelReply(Me.SendRequest("/chat/completions", body), False)
+    End Function
+End Class
+
+Public Class SSEEvent
+    Public Property EventName As String
+    Public Property Data As String
+    Public Property ID As String
+    Public Property IsDone As Boolean
+
+    Internal Sub Constructor(eventName As String, data As String, eventID As String)
+        Me.EventName = eventName
+        Me.Data = data
+        Me.ID = eventID
+        Me.IsDone = String.Compare(data, "[DONE]", True) = 0
+    End Sub
+End Class
+
+''' Incremental SSE parsing for external streaming transports; HTTP clients above remain buffered.
+Public Class ModelSSEDecoder
+    Private Property mLine As Bytes = New Bytes()
+    Private Property mData As String = ""
+    Private Property mEvent As String = ""
+    Private Property mID As String = ""
+    Private Property mHasData As Boolean = False
+    Private Property mSkipLF As Boolean = False
+    Private Property mFailed As Boolean = False
+    Private Property mDone As Boolean = False
+    Private Property mFirstLine As Boolean = True
+    Private Property mMaxLine As Integer
+    Private Property mMaxEvent As Integer
+    Private Property mEventBytes As Integer = 0
+
+    Public Sub Constructor(maxLineBytes As Integer = 1048576, maxEventBytes As Integer = 8388608)
+        If maxLineBytes < 1 Or maxLineBytes > 16777216 Or maxEventBytes < 1 Or maxEventBytes > 67108864 Then Throw New InvalidArgumentException("Invalid SSE bounds")
+        Me.mMaxLine = maxLineBytes
+        Me.mMaxEvent = maxEventBytes
+    End Sub
+
+    Public Property IsFailed As Boolean
+        Get
+            Return Me.mFailed
+        End Get
+    End Property
+    Public Property IsDone As Boolean
+        Get
+            Return Me.mDone
+        End Get
+    End Property
+
+    Public Sub Reset()
+        Me.mLine = New Bytes()
+        Me.mData = ""
+        Me.mEvent = ""
+        Me.mID = ""
+        Me.mHasData = False
+        Me.mSkipLF = False
+        Me.mFailed = False
+        Me.mDone = False
+        Me.mFirstLine = True
+        Me.mEventBytes = 0
+    End Sub
+
+    Private Function ProcessLine() As SSEEvent
+        Dim line As String = Me.mLine.ToString(Text.Encodings.UTF8)
+        Me.mLine = New Bytes()
+        ' SSE permits exactly one UTF-8 BOM at the start of the stream.
+        If Me.mFirstLine Then
+            Me.mFirstLine = False
+            If String.StartsWith(line, "﻿", True) Then line = String.Substring(line, 1)
+        End If
+        If line = "" Then
+            If Not Me.mHasData Then
+                Me.mEvent = ""
+                Return Nil
+            End If
+            Dim kind As String = Me.mEvent
+            If kind = "" Then kind = "message"
+            If String.Compare(Me.mData, "[DONE]", True) <> 0 Then
+                Dim parsedData As JSONItem = ParseModelJSON(Me.mData)
+            End If
+            Dim item As New SSEEvent(kind, Me.mData, Me.mID)
+            If item.IsDone Then Me.mDone = True
+            Me.mData = ""
+            Me.mEvent = ""
+            Me.mHasData = False
+            Me.mEventBytes = 0
+            Return item
+        End If
+        If String.StartsWith(line, ":") Then Return Nil
+        Dim colon As Integer = String.IndexOf(line, ":")
+        Dim field As String = line
+        Dim value As String = ""
+        If colon >= 0 Then
+            field = String.Left(line, colon)
+            value = String.Substring(line, colon + 1)
+            If String.StartsWith(value, " ") Then value = String.Substring(value, 1)
+        End If
+        If String.Compare(field, "data", True) = 0 Then
+            Dim size As Integer = Bytes.FromString(value, Text.Encodings.UTF8).Count
+            If Me.mHasData Then size += 1
+            If size > Me.mMaxEvent - Me.mEventBytes Then Throw New InvalidArgumentException("SSE event exceeds configured limit")
+            If Me.mHasData Then Me.mData += "\n"
+            Me.mData += value
+            Me.mEventBytes += size
+            Me.mHasData = True
+        ElseIf String.Compare(field, "event", True) = 0 Then
+            Me.mEvent = value
+        ElseIf String.Compare(field, "id", True) = 0 Then
+            Dim data As Bytes = Bytes.FromString(value, Text.Encodings.UTF8)
+            Dim hasNul As Boolean = False
+            For i As Integer = 0 To data.Count - 1
+                If data.Item(i) = 0 Then hasNul = True
+            Next
+            If Not hasNul Then Me.mID = value
+        End If
+        Return Nil
+    End Function
+
+    Public Function Feed(chunk As Bytes) As Array Of SSEEvent
+        If Me.mFailed Then Throw New InvalidArgumentException("SSE decoder failed; Reset before reuse")
+        If chunk = Nil Then Throw New InvalidArgumentException("SSE bytes required")
+        Dim events As Array Of SSEEvent = []
+        Try
+            If chunk.Count > 33554432 Then Throw New InvalidArgumentException("SSE feed exceeds 32 MiB")
+            For i As Integer = 0 To chunk.Count - 1
+                Dim n As Integer = chunk.Item(i)
+                If Me.mSkipLF Then
+                    Me.mSkipLF = False
+                    If n = 10 Then Continue For
+                End If
+                If n = 13 Or n = 10 Then
+                    Dim item As SSEEvent = Me.ProcessLine()
+                    If item <> Nil Then
+                        If Array.Count(events) >= 4096 Then Throw New InvalidArgumentException("Too many SSE events per feed")
+                        Array.Append(events, item)
+                    End If
+                    If n = 13 Then Me.mSkipLF = True
+                Else
+                    If Me.mLine.Count >= Me.mMaxLine Then Throw New InvalidArgumentException("SSE line exceeds configured limit")
+                    Me.mLine.Append(n)
+                End If
+            Next
+        Catch e As Exception
+            Me.mFailed = True
+            Throw e
+        End Try
+        Return events
+    End Function
+
+    ''' EOF discards an incomplete event, as required by SSE. Invalid UTF8 still fails.
+    Public Sub Finish()
+        If Me.mFailed Then Throw New InvalidArgumentException("SSE decoder failed; Reset before reuse")
+        Try
+            If Me.mLine.Count > 0 Then
+                Dim ignored As SSEEvent = Me.ProcessLine()
+            End If
+            Me.mLine = New Bytes()
+            Me.mData = ""
+            Me.mEvent = ""
+            Me.mHasData = False
+            Me.mEventBytes = 0
+            Me.mSkipLF = False
+        Catch e As Exception
+            Me.mFailed = True
+            Throw e
+        End Try
+    End Sub
+End Class

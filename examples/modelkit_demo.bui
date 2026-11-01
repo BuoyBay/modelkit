@@ -1,0 +1,10 @@
+Import modelkit
+
+' Offline payload example; create a ModelClient and call CreateResponse on a worker to send it.
+Sub Main()
+    Dim schema As JSONItem = Json.Parse("{\"type\":\"object\",\"properties\":{\"itemId\":{\"type\":\"string\"}},\"required\":[\"itemId\"]}")
+    Print Json.Stringify(FunctionTool("project_read_item", "Read a project item's unsaved buffer", schema))
+    Print Json.Stringify(TextMessage("user", "Explain the active document"))
+    Dim fixture As JSONItem = Json.Parse("{\"id\":\"offline-example\",\"status\":\"completed\",\"output\":[{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"Agent replies and tools use the same project model.\"}]}]}")
+    Print ParseModelReply(fixture).Text
+End Sub

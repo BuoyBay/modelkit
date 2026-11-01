@@ -1,0 +1,6 @@
+{
+  "schema": 1,
+  "name": "modelkit",
+  "version": "0.1.0",
+  "description": "Grok and Meta Muse Responses/chat clients, typed function calls, reasoning-preserving replay and bounded SSE decoding"
+}
