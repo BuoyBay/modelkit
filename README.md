@@ -1,4 +1,4 @@
-# Typed model APIs — tools, streaming (Grok/xAI, Muse)
+# Typed LLM client with tools
 
 Source-only clients for **Grok/xAI** and **Meta Muse** with explicit model
 selection, function-tool calls and conversation replay. Both providers document

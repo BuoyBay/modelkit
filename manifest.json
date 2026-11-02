@@ -2,5 +2,5 @@
   "schema": 1,
   "name": "modelkit",
   "version": "0.1.0",
-  "description": "Typed model APIs \u2014 tools, streaming (Grok/xAI, Muse)"
+  "description": "Typed LLM client with tools"
 }
