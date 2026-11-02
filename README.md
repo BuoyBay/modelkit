@@ -1,4 +1,4 @@
-# Call model APIs with typed tools and streaming replies
+# Typed model APIs — tools, streaming (Grok/xAI, Muse)
 
 Source-only clients for **Grok/xAI** and **Meta Muse** with explicit model
 selection, function-tool calls and conversation replay. Both providers document
@@ -18,7 +18,7 @@ consumer project for reproducible installs.
 
 ## Example
 
-```buoy
+```basic
 Import modelkit
 
 ' Offline payload example; create a ModelClient and call CreateResponse on a worker to send it.
