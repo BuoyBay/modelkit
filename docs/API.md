@@ -81,18 +81,6 @@ function arguments or infer completion from arbitrary SSE events.
 
 ## Verification and scope
 
-
-The runner seals a standalone package, checks module/test/example with the real
-compiler on six target aliases, and executes a local synthetic HTTP provider.
-Tests cover both API dialects, request headers/bodies, Unicode, function calls,
-reasoning/output replay, orphan tool results, rate limits, token redaction,
-redirect refusal, malformed tool arguments, fragmented SSE and parser limits.
-Adversarial fixtures send 20,000 nested arrays (both response bodies and tool
-argument strings), NUL escapes, literal escaped slashes, malformed numbers and
-numeric overflow; they reject without entering unsafe runtime recursion.
-No real account, API key or live inference is used. Authenticated provider access
-and model availability require account-specific verification.
-
 Only text and local function tools are exposed. The package does not implement
 provider-hosted tools, files/images/audio, background responses, cancellation,
 usage aggregation or a complete autonomous agent loop. Raw response JSON remains
@@ -104,5 +92,3 @@ Primary references:
 [Meta Chat Completions](https://dev.meta.ai/docs/protocols/chat-completions),
 [xAI Responses](https://docs.x.ai/developers/rest-api-reference/inference/responses),
 [xAI Chat Completions](https://docs.x.ai/developers/rest-api-reference/inference/chat-completions).
-
-Test suites and fixtures are maintainer-local and are not part of this public repository.

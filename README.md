@@ -1,6 +1,6 @@
 # Call model APIs with typed tools and streaming replies
 
-Source-only Buoy clients for **Grok/xAI** and **Meta Muse** with explicit model
+Source-only clients for **Grok/xAI** and **Meta Muse** with explicit model
 selection, function-tool calls and conversation replay. Both providers document
 Responses and OpenAI-compatible Chat Completions endpoints. This package uses
 their published wire formats; it does not install a coding-agent harness.
@@ -50,8 +50,6 @@ On your own machine, install Buoy and run:
 ```sh
 buoy ai init --both
 ```
-
-The generated agent files and editor settings stay local and are ignored by Git.
 
 ## Contributing
 
